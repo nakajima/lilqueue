@@ -290,6 +290,62 @@ async fn run_until_shutdown_wakes_when_job_is_enqueued() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn run_until_notified_wakes_when_job_is_enqueued() {
+    let dir = tempdir().unwrap();
+    let db_url = sqlite_url(dir.path().join("queue.db"));
+
+    let mut options = test_options();
+    options.poll_interval = Duration::from_secs(60);
+
+    let processor = SqliteJobProcessor::<WriteFileJob>::connect(&db_url, options)
+        .await
+        .unwrap();
+
+    let output_path = dir.path().join("notify.log");
+    let output_path_str = output_path.to_string_lossy().to_string();
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let worker_processor = processor.clone();
+    let worker_shutdown = Arc::clone(&shutdown);
+    let worker = tokio::spawn(async move {
+        worker_processor
+            .run_until_notified(worker_shutdown.as_ref())
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    processor
+        .enqueue(&WriteFileJob {
+            output_path: output_path_str,
+            line: "wake".to_string(),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if fs::read_to_string(&output_path)
+                .map(|contents| contents.contains("wake"))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    shutdown.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 fn test_options() -> ProcessorOptions {
     ProcessorOptions {
         max_attempts: 3,

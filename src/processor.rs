@@ -182,17 +182,33 @@ where
         while !shutdown.load(Ordering::Relaxed) {
             match self.run_once().await? {
                 RunOutcome::Idle => {
-                    if self.has_pending_jobs().await? {
-                        tokio::time::sleep(self.options.poll_interval).await;
-                    } else {
-                        self.wait_for_enqueue_or_shutdown(shutdown).await;
-                    }
+                    let now = now_epoch_seconds()?;
+                    let wake_delay = self.next_wakeup_delay(now).await?;
+                    self.wait_for_enqueue_or_shutdown(shutdown, wake_delay).await;
                 }
                 _ => {}
             }
         }
 
         Ok(())
+    }
+
+    pub async fn run_until_notified(
+        &self,
+        shutdown: &tokio::sync::Notify,
+    ) -> Result<(), QueueError> {
+        loop {
+            match self.run_once().await? {
+                RunOutcome::Idle => {
+                    let now = now_epoch_seconds()?;
+                    let wake_delay = self.next_wakeup_delay(now).await?;
+                    if self.wait_for_enqueue_or_shutdown_notify(shutdown, wake_delay).await {
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     async fn initialize_schema(&self) -> Result<(), QueueError> {
@@ -263,36 +279,98 @@ where
         Ok(())
     }
 
-    async fn has_pending_jobs(&self) -> Result<bool, QueueError> {
+    async fn next_wakeup_delay(&self, now: i64) -> Result<Option<Duration>, QueueError> {
+        let lock_timeout_secs = duration_to_secs(self.options.lock_timeout);
         let statement = Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT 1
+            "SELECT MIN(
+                CASE
+                    WHEN status = ? THEN available_at
+                    WHEN status = ? AND locked_at IS NOT NULL THEN locked_at + ?
+                    ELSE NULL
+                END
+             )
              FROM jobs
              WHERE job_type = ?
                AND status IN (?, ?)
-             LIMIT 1"
+            "
                 .to_string(),
             vec![
+                STATUS_QUEUED.into(),
+                STATUS_PROCESSING.into(),
+                lock_timeout_secs.into(),
                 Self::job_type().into(),
                 STATUS_QUEUED.into(),
                 STATUS_PROCESSING.into(),
             ],
         );
 
-        Ok(self.db.query_one(statement).await?.is_some())
-    }
+        let Some(row) = self.db.query_one(statement).await? else {
+            return Ok(None);
+        };
 
-    async fn wait_for_enqueue_or_shutdown(&self, shutdown: &AtomicBool) {
-        let mut shutdown_check_interval =
-            std::cmp::min(self.options.poll_interval, Duration::from_millis(250));
-        if shutdown_check_interval.is_zero() {
-            shutdown_check_interval = Duration::from_millis(1);
+        let wake_at: Option<i64> = row
+            .try_get_by_index(0)
+            .map_err(|e| QueueError::RowDecode(format!("{e:?}")))?;
+        let Some(wake_at) = wake_at else {
+            return Ok(None);
+        };
+
+        if wake_at <= now {
+            return Ok(Some(non_zero_poll_interval(self.options.poll_interval)));
         }
 
+        let delay_secs = u64::try_from(wake_at.saturating_sub(now)).unwrap_or(u64::MAX);
+        Ok(Some(Duration::from_secs(delay_secs)))
+    }
+
+    async fn wait_for_enqueue_or_shutdown(
+        &self,
+        shutdown: &AtomicBool,
+        wake_delay: Option<Duration>,
+    ) {
+        let shutdown_check_interval =
+            std::cmp::min(non_zero_poll_interval(self.options.poll_interval), Duration::from_millis(250));
+        let mut remaining = wake_delay;
+
         while !shutdown.load(Ordering::Relaxed) {
+            let chunk = match remaining {
+                Some(duration) => std::cmp::min(duration, shutdown_check_interval),
+                None => shutdown_check_interval,
+            };
+
             tokio::select! {
                 _ = self.enqueue_notify.notified() => return,
-                _ = tokio::time::sleep(shutdown_check_interval) => {}
+                _ = tokio::time::sleep(chunk) => {}
+            }
+
+            if let Some(duration) = remaining {
+                if duration <= chunk {
+                    return;
+                }
+                remaining = Some(duration.saturating_sub(chunk));
+            }
+        }
+    }
+
+    async fn wait_for_enqueue_or_shutdown_notify(
+        &self,
+        shutdown: &tokio::sync::Notify,
+        wake_delay: Option<Duration>,
+    ) -> bool {
+        match wake_delay {
+            Some(delay) => {
+                tokio::select! {
+                    _ = self.enqueue_notify.notified() => false,
+                    _ = tokio::time::sleep(delay) => false,
+                    _ = shutdown.notified() => true,
+                }
+            }
+            None => {
+                tokio::select! {
+                    _ = self.enqueue_notify.notified() => false,
+                    _ = shutdown.notified() => true,
+                }
             }
         }
     }
@@ -504,4 +582,12 @@ fn now_epoch_seconds() -> Result<i64, std::time::SystemTimeError> {
 
 fn duration_to_secs(duration: Duration) -> i64 {
     i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+}
+
+fn non_zero_poll_interval(interval: Duration) -> Duration {
+    if interval.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        interval
+    }
 }
