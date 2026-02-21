@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{OriginalUri, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::get,
@@ -108,12 +108,22 @@ pub fn router_with_options(db: DatabaseConnection, options: DashboardOptions) ->
         .with_state(state)
 }
 
-async fn index(State(state): State<DashboardState>) -> DashboardResult<Html<String>> {
+async fn index(
+    State(state): State<DashboardState>,
+    OriginalUri(uri): OriginalUri,
+) -> DashboardResult<Html<String>> {
     let limit = resolve_limit(None, &state.options);
     let stats = fetch_stats(&state.db).await?;
     let jobs = fetch_jobs(&state.db, limit).await?;
+    let stats_path = api_path(uri.path(), "stats");
+    let jobs_path = api_path(uri.path(), "jobs");
 
-    Ok(Html(render_dashboard_html(&stats, &jobs)))
+    Ok(Html(render_dashboard_html(
+        &stats,
+        &jobs,
+        &stats_path,
+        &jobs_path,
+    )))
 }
 
 async fn stats(State(state): State<DashboardState>) -> DashboardResult<Json<DashboardStats>> {
@@ -209,6 +219,15 @@ fn resolve_limit(limit: Option<u64>, options: &DashboardOptions) -> i64 {
     i64::try_from(clamped).unwrap_or(i64::MAX)
 }
 
+fn api_path(index_path: &str, endpoint: &str) -> String {
+    let mount = index_path.trim_end_matches('/');
+    if mount.is_empty() {
+        format!("/api/{endpoint}")
+    } else {
+        format!("{mount}/api/{endpoint}")
+    }
+}
+
 fn try_get_by_index<T>(row: &QueryResult, index: usize) -> DashboardResult<T>
 where
     T: sea_orm::TryGetable,
@@ -217,7 +236,12 @@ where
         .map_err(|e| DashboardError::RowDecode(format!("{e:?}")))
 }
 
-fn render_dashboard_html(stats: &DashboardStats, jobs: &[DashboardJob]) -> String {
+fn render_dashboard_html(
+    stats: &DashboardStats,
+    jobs: &[DashboardJob],
+    stats_path: &str,
+    jobs_path: &str,
+) -> String {
     let mut rows = String::new();
     for job in jobs {
         let job_type = html_escape(&job.job_type);
@@ -246,20 +270,22 @@ fn render_dashboard_html(stats: &DashboardStats, jobs: &[DashboardJob]) -> Strin
            <meta name='viewport' content='width=device-width, initial-scale=1'>\
            <title>lilqueue dashboard</title>\
            <style>\
-             body {{ font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; margin: 2rem; }}\
+             body {{ font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; margin: 2rem; background: #111; color: #e5e5e5; }}\
              .stats {{ display: grid; gap: 0.75rem; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); margin-bottom: 1.5rem; }}\
-             .card {{ border: 1px solid #ddd; border-radius: 8px; padding: 0.75rem; }}\
-             .label {{ color: #666; font-size: 0.8rem; }}\
+             .card {{ border: 1px solid #3a3a3a; padding: 0.75rem; background: #1a1a1a; }}\
+             .label {{ color: #a3a3a3; font-size: 0.8rem; }}\
              .value {{ font-size: 1.25rem; font-weight: 600; }}\
              table {{ border-collapse: collapse; width: 100%; }}\
-             th, td {{ text-align: left; border-bottom: 1px solid #eee; padding: 0.5rem; vertical-align: top; }}\
-             code {{ white-space: pre-wrap; word-break: break-word; font-size: 0.85rem; }}\
+             th, td {{ text-align: left; border-bottom: 1px solid #3a3a3a; padding: 0.5rem; vertical-align: top; }}\
+             th {{ color: #bdbdbd; }}\
+             code {{ white-space: pre-wrap; word-break: break-word; font-size: 0.85rem; color: #f5f5f5; }}\
+             a {{ color: #93c5fd; }}\
              .links {{ margin-bottom: 1rem; }}\
            </style>\
          </head>\
          <body>\
            <h1>lilqueue dashboard</h1>\
-           <p class='links'>JSON: <a href='/api/stats'>/api/stats</a> | <a href='/api/jobs'>/api/jobs</a></p>\
+           <p class='links'>JSON: <a href='{}'>{}</a> | <a href='{}'>{}</a></p>\
            <section class='stats'>\
              <div class='card'><div class='label'>total</div><div class='value'>{}</div></div>\
              <div class='card'><div class='label'>queued</div><div class='value'>{}</div></div>\
@@ -275,7 +301,16 @@ fn render_dashboard_html(stats: &DashboardStats, jobs: &[DashboardJob]) -> Strin
            </table>\
          </body>\
          </html>",
-        stats.total, stats.queued, stats.processing, stats.completed, stats.failed, rows
+        stats_path,
+        stats_path,
+        jobs_path,
+        jobs_path,
+        stats.total,
+        stats.queued,
+        stats.processing,
+        stats.completed,
+        stats.failed,
+        rows
     )
 }
 
@@ -314,6 +349,7 @@ mod tests {
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
+        Router,
     };
     use std::{path::Path, time::Duration};
     use tempfile::tempdir;
@@ -405,6 +441,37 @@ mod tests {
         let html = String::from_utf8(index_bytes.to_vec()).unwrap();
         assert!(html.contains("lilqueue dashboard"));
         assert!(html.contains("/api/jobs"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_index_links_respect_mount_path() {
+        let dir = tempdir().unwrap();
+        let db_url = sqlite_url(dir.path().join("queue.db"));
+
+        let processor = SqliteJobProcessor::<DashboardTestJob>::connect(&db_url, test_options())
+            .await
+            .unwrap();
+        processor
+            .enqueue(&DashboardTestJob {
+                value: "first".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let app = Router::new().nest("/queue", router(processor.db().clone()));
+
+        let index_response = app
+            .oneshot(Request::builder().uri("/queue").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(index_response.status(), StatusCode::OK);
+
+        let index_bytes = to_bytes(index_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(index_bytes.to_vec()).unwrap();
+        assert!(html.contains("href='/queue/api/stats'"));
+        assert!(html.contains("href='/queue/api/jobs'"));
     }
 
     fn test_options() -> ProcessorOptions {
