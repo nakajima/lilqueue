@@ -5,6 +5,7 @@ use sea_orm::{
 use std::{
     marker::PhantomData,
     path::Path,
+    sync::Arc,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -43,7 +44,6 @@ struct ClaimedJob<J> {
     job: J,
 }
 
-#[derive(Clone)]
 pub struct SqliteJobProcessor<J>
 where
     J: Job,
@@ -51,7 +51,23 @@ where
     db: DatabaseConnection,
     options: ProcessorOptions,
     worker_id: String,
+    enqueue_notify: Arc<tokio::sync::Notify>,
     _marker: PhantomData<J>,
+}
+
+impl<J> Clone for SqliteJobProcessor<J>
+where
+    J: Job,
+{
+    fn clone(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            options: self.options.clone(),
+            worker_id: self.worker_id.clone(),
+            enqueue_notify: Arc::clone(&self.enqueue_notify),
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<J> SqliteJobProcessor<J>
@@ -87,6 +103,7 @@ where
             db,
             options,
             worker_id: make_worker_id(),
+            enqueue_notify: Arc::new(tokio::sync::Notify::new()),
             _marker: PhantomData,
         };
         processor.initialize_schema().await?;
@@ -127,6 +144,7 @@ where
         };
 
         let model = active.insert(&self.db).await?;
+        self.enqueue_notify.notify_one();
         Ok(model.id)
     }
 
@@ -162,9 +180,15 @@ where
 
     pub async fn run_until_shutdown(&self, shutdown: &AtomicBool) -> Result<(), QueueError> {
         while !shutdown.load(Ordering::Relaxed) {
-            let outcome = self.run_once().await?;
-            if outcome == RunOutcome::Idle {
-                tokio::time::sleep(self.options.poll_interval).await;
+            match self.run_once().await? {
+                RunOutcome::Idle => {
+                    if self.has_pending_jobs().await? {
+                        tokio::time::sleep(self.options.poll_interval).await;
+                    } else {
+                        self.wait_for_enqueue_or_shutdown(shutdown).await;
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -237,6 +261,40 @@ where
 
         self.db.execute(statement).await?;
         Ok(())
+    }
+
+    async fn has_pending_jobs(&self) -> Result<bool, QueueError> {
+        let statement = Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT 1
+             FROM jobs
+             WHERE job_type = ?
+               AND status IN (?, ?)
+             LIMIT 1"
+                .to_string(),
+            vec![
+                Self::job_type().into(),
+                STATUS_QUEUED.into(),
+                STATUS_PROCESSING.into(),
+            ],
+        );
+
+        Ok(self.db.query_one(statement).await?.is_some())
+    }
+
+    async fn wait_for_enqueue_or_shutdown(&self, shutdown: &AtomicBool) {
+        let mut shutdown_check_interval =
+            std::cmp::min(self.options.poll_interval, Duration::from_millis(250));
+        if shutdown_check_interval.is_zero() {
+            shutdown_check_interval = Duration::from_millis(1);
+        }
+
+        while !shutdown.load(Ordering::Relaxed) {
+            tokio::select! {
+                _ = self.enqueue_notify.notified() => return,
+                _ = tokio::time::sleep(shutdown_check_interval) => {}
+            }
+        }
     }
 
     async fn claim_next_job(&self, now: i64) -> Result<Option<ClaimedJob<J>>, QueueError> {
