@@ -6,7 +6,7 @@ use std::{
     marker::PhantomData,
     path::Path,
     sync::Arc,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -53,6 +53,40 @@ where
     worker_id: String,
     enqueue_notify: Arc<tokio::sync::Notify>,
     _marker: PhantomData<J>,
+}
+
+#[must_use = "workers are stopped when the handle is dropped"]
+pub struct WorkerHandle {
+    shutdown: Arc<tokio::sync::Notify>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl WorkerHandle {
+    pub fn shutdown(&self) {
+        self.shutdown.notify_waiters();
+    }
+
+    pub async fn wait(mut self) {
+        for task in self.tasks.drain(..) {
+            let _ = task.await;
+        }
+    }
+
+    pub async fn shutdown_and_wait(mut self) {
+        self.shutdown.notify_waiters();
+        for task in self.tasks.drain(..) {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        self.shutdown.notify_waiters();
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
 }
 
 impl<J> Clone for SqliteJobProcessor<J>
@@ -118,6 +152,33 @@ where
         &self.db
     }
 
+    pub fn spawn_worker(&self) -> WorkerHandle {
+        self.spawn_workers(1)
+    }
+
+    pub fn spawn_workers(&self, concurrency: usize) -> WorkerHandle {
+        let count = concurrency.max(1);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let mut tasks = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let processor = self.clone();
+            let shutdown_signal = Arc::clone(&shutdown);
+            let retry_delay = non_zero_poll_interval(self.options.poll_interval);
+
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    match processor.run_until_notified(shutdown_signal.as_ref()).await {
+                        Ok(()) => break,
+                        Err(_) => tokio::time::sleep(retry_delay).await,
+                    }
+                }
+            }));
+        }
+
+        WorkerHandle { shutdown, tasks }
+    }
+
     pub async fn enqueue(&self, job: &J) -> Result<i64, QueueError> {
         self.enqueue_with_delay(job, Duration::ZERO).await
     }
@@ -148,7 +209,7 @@ where
         Ok(model.id)
     }
 
-    pub async fn run_once(&self) -> Result<RunOutcome, QueueError> {
+    pub(crate) async fn run_once(&self) -> Result<RunOutcome, QueueError> {
         let now = now_epoch_seconds()?;
         self.reclaim_stale_locks(now).await?;
 
@@ -168,32 +229,7 @@ where
         }
     }
 
-    pub async fn run_until_idle(&self) -> Result<u64, QueueError> {
-        let mut processed = 0;
-        loop {
-            match self.run_once().await? {
-                RunOutcome::Idle => return Ok(processed),
-                _ => processed += 1,
-            }
-        }
-    }
-
-    pub async fn run_until_shutdown(&self, shutdown: &AtomicBool) -> Result<(), QueueError> {
-        while !shutdown.load(Ordering::Relaxed) {
-            match self.run_once().await? {
-                RunOutcome::Idle => {
-                    let now = now_epoch_seconds()?;
-                    let wake_delay = self.next_wakeup_delay(now).await?;
-                    self.wait_for_enqueue_or_shutdown(shutdown, wake_delay).await;
-                }
-                _ => {}
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn run_until_notified(
+    pub(crate) async fn run_until_notified(
         &self,
         shutdown: &tokio::sync::Notify,
     ) -> Result<(), QueueError> {
@@ -322,35 +358,6 @@ where
 
         let delay_secs = u64::try_from(wake_at.saturating_sub(now)).unwrap_or(u64::MAX);
         Ok(Some(Duration::from_secs(delay_secs)))
-    }
-
-    async fn wait_for_enqueue_or_shutdown(
-        &self,
-        shutdown: &AtomicBool,
-        wake_delay: Option<Duration>,
-    ) {
-        let shutdown_check_interval =
-            std::cmp::min(non_zero_poll_interval(self.options.poll_interval), Duration::from_millis(250));
-        let mut remaining = wake_delay;
-
-        while !shutdown.load(Ordering::Relaxed) {
-            let chunk = match remaining {
-                Some(duration) => std::cmp::min(duration, shutdown_check_interval),
-                None => shutdown_check_interval,
-            };
-
-            tokio::select! {
-                _ = self.enqueue_notify.notified() => return,
-                _ = tokio::time::sleep(chunk) => {}
-            }
-
-            if let Some(duration) = remaining {
-                if duration <= chunk {
-                    return;
-                }
-                remaining = Some(duration.saturating_sub(chunk));
-            }
-        }
     }
 
     async fn wait_for_enqueue_or_shutdown_notify(

@@ -4,7 +4,7 @@ mod entity;
 mod processor;
 mod types;
 
-pub use processor::{QueueError, SqliteJobProcessor};
+pub use processor::{QueueError, SqliteJobProcessor, WorkerHandle};
 pub use types::{BackoffStrategy, Job, JobError, ProcessorOptions, RunOutcome};
 
 #[cfg(test)]

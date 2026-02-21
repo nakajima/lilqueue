@@ -12,6 +12,7 @@ jobs are plain `serde`-serializable structs that implement a single-method trait
 use async_trait::async_trait;
 use lilqueue::{Job, JobError, ProcessorOptions, SqliteJobProcessor};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct EmailJob {
@@ -32,6 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let processor =
         SqliteJobProcessor::<EmailJob>::connect_path("queue.db", ProcessorOptions::default())
             .await?;
+    let worker = processor.spawn_worker();
 
     processor
         .enqueue(&EmailJob {
@@ -40,8 +42,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
-    // process one job
-    let _ = processor.run_once().await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    worker.shutdown_and_wait().await;
 
     Ok(())
 }
