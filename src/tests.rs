@@ -1,6 +1,6 @@
 use super::*;
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
 use std::{
     fs,
     path::Path,
@@ -85,6 +85,20 @@ async fn processes_successful_job() {
     let file_contents = fs::read_to_string(output_path).unwrap();
     assert!(file_contents.contains("hello"));
 
+    let timings = load_timing_row(processor.db(), id).await;
+    assert!(timings.first_enqueued_at.is_some());
+    assert!(timings.last_enqueued_at.is_some());
+    assert!(timings.first_started_at.is_some());
+    assert!(timings.last_started_at.is_some());
+    assert!(timings.last_finished_at.is_some());
+    assert!(timings.queued_ms_total >= 0);
+    assert!(timings.processing_ms_total >= 0);
+    assert_eq!(timings.queued_ms_total, timings.queued_ms_last.unwrap_or_default());
+    assert_eq!(
+        timings.processing_ms_total,
+        timings.processing_ms_last.unwrap_or_default()
+    );
+
     let idle = processor.run_once().await.unwrap();
     assert_eq!(idle, RunOutcome::Idle);
 }
@@ -115,6 +129,15 @@ async fn retries_and_then_completes() {
 
     let second = processor.run_once().await.unwrap();
     assert!(matches!(second, RunOutcome::Completed { attempts: 2, .. }));
+
+    let job_id = match second {
+        RunOutcome::Completed { job_id, .. } => job_id,
+        _ => unreachable!(),
+    };
+    let timings = load_timing_row(processor.db(), job_id).await;
+    assert!(timings.queued_ms_total >= timings.queued_ms_last.unwrap_or_default());
+    assert!(timings.processing_ms_total >= timings.processing_ms_last.unwrap_or_default());
+    assert!(timings.processing_ms_total >= 0);
 
     let attempts_file = fs::read_to_string(state_path).unwrap();
     assert_eq!(attempts_file.trim(), "2");
@@ -156,6 +179,10 @@ async fn reclaims_stale_processing_job_after_crash() {
 
     let outcome = processor.run_once().await.unwrap();
     assert!(matches!(outcome, RunOutcome::Completed { job_id: id, .. } if id == job_id));
+
+    let timings = load_timing_row(processor.db(), job_id).await;
+    assert!(timings.processing_ms_total >= 59_000);
+    assert!(timings.last_enqueued_at.is_some());
 
     let file_contents = fs::read_to_string(output_path).unwrap();
     assert!(file_contents.contains("recovered"));
@@ -218,6 +245,86 @@ async fn connect_path_works() {
 
     assert_eq!(count, 0);
     drop(processor);
+}
+
+#[tokio::test]
+async fn initialize_schema_adds_timing_columns_for_existing_table() {
+    let dir = tempdir().unwrap();
+    let db_url = sqlite_url(dir.path().join("queue.db"));
+    let db = Database::connect(&db_url).await.unwrap();
+
+    db.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        "DROP TABLE IF EXISTS jobs".to_string(),
+    ))
+    .await
+    .unwrap();
+
+    db.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        "CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL,
+            available_at INTEGER NOT NULL,
+            locked_at INTEGER NULL,
+            lock_token TEXT NULL,
+            last_error TEXT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            completed_at INTEGER NULL
+        )"
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO jobs
+         (job_type, payload, status, attempts, max_attempts, available_at, locked_at, lock_token, last_error, created_at, updated_at, completed_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL)"
+            .to_string(),
+        vec![
+            std::any::type_name::<WriteFileJob>().into(),
+            "{}".into(),
+            "queued".into(),
+            0.into(),
+            3.into(),
+            100.into(),
+            42.into(),
+            42.into(),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    drop(db);
+
+    let processor = SqliteJobProcessor::<WriteFileJob>::connect(&db_url, test_options())
+        .await
+        .unwrap();
+
+    let row = processor
+        .db()
+        .query_one(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT first_enqueued_at, queued_ms_total, processing_ms_total FROM jobs WHERE id = 1"
+                .to_string(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let first_enqueued_at: Option<i64> = row.try_get_by_index(0).unwrap();
+    let queued_ms_total: i64 = row.try_get_by_index(1).unwrap();
+    let processing_ms_total: i64 = row.try_get_by_index(2).unwrap();
+    assert_eq!(first_enqueued_at, Some(42));
+    assert_eq!(queued_ms_total, 0);
+    assert_eq!(processing_ms_total, 0);
 }
 
 #[tokio::test]
@@ -336,4 +443,52 @@ fn current_epoch_seconds() -> i64 {
         .unwrap()
         .as_secs();
     i64::try_from(secs).unwrap_or(i64::MAX)
+}
+
+#[derive(Debug)]
+struct TimingRow {
+    first_enqueued_at: Option<i64>,
+    last_enqueued_at: Option<i64>,
+    first_started_at: Option<i64>,
+    last_started_at: Option<i64>,
+    last_finished_at: Option<i64>,
+    queued_ms_total: i64,
+    queued_ms_last: Option<i64>,
+    processing_ms_total: i64,
+    processing_ms_last: Option<i64>,
+}
+
+async fn load_timing_row(db: &DatabaseConnection, job_id: i64) -> TimingRow {
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT
+                first_enqueued_at,
+                last_enqueued_at,
+                first_started_at,
+                last_started_at,
+                last_finished_at,
+                queued_ms_total,
+                queued_ms_last,
+                processing_ms_total,
+                processing_ms_last
+             FROM jobs WHERE id = ?"
+                .to_string(),
+            vec![job_id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+
+    TimingRow {
+        first_enqueued_at: row.try_get_by_index(0).unwrap(),
+        last_enqueued_at: row.try_get_by_index(1).unwrap(),
+        first_started_at: row.try_get_by_index(2).unwrap(),
+        last_started_at: row.try_get_by_index(3).unwrap(),
+        last_finished_at: row.try_get_by_index(4).unwrap(),
+        queued_ms_total: row.try_get_by_index(5).unwrap(),
+        queued_ms_last: row.try_get_by_index(6).unwrap(),
+        processing_ms_total: row.try_get_by_index(7).unwrap(),
+        processing_ms_last: row.try_get_by_index(8).unwrap(),
+    }
 }

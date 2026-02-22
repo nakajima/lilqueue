@@ -56,6 +56,15 @@ pub struct DashboardJob {
     pub created_at: i64,
     pub updated_at: i64,
     pub completed_at: Option<i64>,
+    pub first_enqueued_at: Option<i64>,
+    pub last_enqueued_at: Option<i64>,
+    pub first_started_at: Option<i64>,
+    pub last_started_at: Option<i64>,
+    pub last_finished_at: Option<i64>,
+    pub queued_ms_total: i64,
+    pub queued_ms_last: Option<i64>,
+    pub processing_ms_total: i64,
+    pub processing_ms_last: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,7 +191,16 @@ async fn fetch_jobs(db: &DatabaseConnection, limit: i64) -> DashboardResult<Vec<
              last_error,
              created_at,
              updated_at,
-             completed_at
+             completed_at,
+             first_enqueued_at,
+             last_enqueued_at,
+             first_started_at,
+             last_started_at,
+             last_finished_at,
+             queued_ms_total,
+             queued_ms_last,
+             processing_ms_total,
+             processing_ms_last
          FROM jobs
          ORDER BY id DESC
          LIMIT ?"
@@ -207,6 +225,15 @@ async fn fetch_jobs(db: &DatabaseConnection, limit: i64) -> DashboardResult<Vec<
             created_at: try_get_by_index::<i64>(&row, 9)?,
             updated_at: try_get_by_index::<i64>(&row, 10)?,
             completed_at: try_get_by_index::<Option<i64>>(&row, 11)?,
+            first_enqueued_at: try_get_by_index::<Option<i64>>(&row, 12)?,
+            last_enqueued_at: try_get_by_index::<Option<i64>>(&row, 13)?,
+            first_started_at: try_get_by_index::<Option<i64>>(&row, 14)?,
+            last_started_at: try_get_by_index::<Option<i64>>(&row, 15)?,
+            last_finished_at: try_get_by_index::<Option<i64>>(&row, 16)?,
+            queued_ms_total: try_get_by_index::<i64>(&row, 17)?,
+            queued_ms_last: try_get_by_index::<Option<i64>>(&row, 18)?,
+            processing_ms_total: try_get_by_index::<i64>(&row, 19)?,
+            processing_ms_last: try_get_by_index::<Option<i64>>(&row, 20)?,
         });
     }
 
@@ -248,6 +275,11 @@ fn render_dashboard_html(
         let status = html_escape(&job.status);
         let payload = html_escape(&truncate(&job.payload, 120));
         let last_error = html_escape(job.last_error.as_deref().unwrap_or(""));
+        let queued = html_escape(&format_timing_ms(job.queued_ms_total, job.queued_ms_last));
+        let processed = html_escape(&format_timing_ms(
+            job.processing_ms_total,
+            job.processing_ms_last,
+        ));
 
         rows.push_str(&format!(
             "<tr>\
@@ -255,10 +287,20 @@ fn render_dashboard_html(
                 <td>{}</td>\
                 <td>{}</td>\
                 <td>{}/{}</td>\
+                <td>{}</td>\
+                <td>{}</td>\
                 <td><code>{}</code></td>\
                 <td><code>{}</code></td>\
              </tr>",
-            job.id, job_type, status, job.attempts, job.max_attempts, payload, last_error
+            job.id,
+            job_type,
+            status,
+            job.attempts,
+            job.max_attempts,
+            queued,
+            processed,
+            payload,
+            last_error
         ));
     }
 
@@ -295,7 +337,7 @@ fn render_dashboard_html(
            </section>\
            <table>\
              <thead>\
-               <tr><th>ID</th><th>Type</th><th>Status</th><th>Attempts</th><th>Payload</th><th>Last error</th></tr>\
+               <tr><th>ID</th><th>Type</th><th>Status</th><th>Attempts</th><th>Queued</th><th>Processed</th><th>Payload</th><th>Last error</th></tr>\
              </thead>\
              <tbody>{}</tbody>\
            </table>\
@@ -339,6 +381,11 @@ fn html_escape(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn format_timing_ms(total: i64, last: Option<i64>) -> String {
+    let last_display = last.unwrap_or_default();
+    format!("{total} ms (last {last_display} ms)")
 }
 
 #[cfg(test)]
@@ -428,6 +475,10 @@ mod tests {
             .unwrap();
         let jobs: JobsResponse = serde_json::from_slice(&jobs_bytes).unwrap();
         assert_eq!(jobs.jobs.len(), 1);
+        assert!(jobs.jobs[0].first_enqueued_at.is_some());
+        assert!(jobs.jobs[0].last_enqueued_at.is_some());
+        assert!(jobs.jobs[0].queued_ms_total >= 0);
+        assert!(jobs.jobs[0].processing_ms_total >= 0);
 
         let index_response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -441,6 +492,8 @@ mod tests {
         let html = String::from_utf8(index_bytes.to_vec()).unwrap();
         assert!(html.contains("lilqueue dashboard"));
         assert!(html.contains("/api/jobs"));
+        assert!(html.contains("<th>Queued</th>"));
+        assert!(html.contains("<th>Processed</th>"));
     }
 
     #[tokio::test]

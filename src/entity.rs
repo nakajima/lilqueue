@@ -18,6 +18,15 @@ pub mod jobs {
         pub created_at: i64,
         pub updated_at: i64,
         pub completed_at: Option<i64>,
+        pub first_enqueued_at: Option<i64>,
+        pub last_enqueued_at: Option<i64>,
+        pub first_started_at: Option<i64>,
+        pub last_started_at: Option<i64>,
+        pub last_finished_at: Option<i64>,
+        pub queued_ms_total: i64,
+        pub queued_ms_last: Option<i64>,
+        pub processing_ms_total: i64,
+        pub processing_ms_last: Option<i64>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

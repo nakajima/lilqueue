@@ -68,4 +68,4 @@ dashboard routes:
 
 - `GET /queue/` (HTML overview)
 - `GET /queue/api/stats` (JSON counters)
-- `GET /queue/api/jobs?limit=50` (JSON recent jobs)
+- `GET /queue/api/jobs?limit=50` (JSON recent jobs with queued/processed timing fields)

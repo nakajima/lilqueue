@@ -3,6 +3,7 @@ use sea_orm::{
     ActiveModelTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend, DbErr, Statement,
 };
 use std::{
+    collections::HashSet,
     marker::PhantomData,
     path::Path,
     sync::Arc,
@@ -40,6 +41,7 @@ struct ClaimedJob<J> {
     id: i64,
     attempts: u32,
     max_attempts: u32,
+    started_at: i64,
     lock_token: String,
     job: J,
 }
@@ -201,6 +203,15 @@ where
             created_at: sea_orm::Set(now),
             updated_at: sea_orm::Set(now),
             completed_at: sea_orm::Set(None),
+            first_enqueued_at: sea_orm::Set(Some(now)),
+            last_enqueued_at: sea_orm::Set(Some(now)),
+            first_started_at: sea_orm::Set(None),
+            last_started_at: sea_orm::Set(None),
+            last_finished_at: sea_orm::Set(None),
+            queued_ms_total: sea_orm::Set(0),
+            queued_ms_last: sea_orm::Set(None),
+            processing_ms_total: sea_orm::Set(0),
+            processing_ms_last: sea_orm::Set(None),
             ..Default::default()
         };
 
@@ -219,7 +230,8 @@ where
 
         match claimed.job.process().await {
             Ok(()) => {
-                self.mark_completed(claimed.id, &claimed.lock_token).await?;
+                self.mark_completed(claimed.id, &claimed.lock_token, claimed.started_at)
+                    .await?;
                 Ok(RunOutcome::Completed {
                     job_id: claimed.id,
                     attempts: claimed.attempts,
@@ -264,11 +276,22 @@ where
                     last_error TEXT NULL,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
-                    completed_at INTEGER NULL
+                    completed_at INTEGER NULL,
+                    first_enqueued_at INTEGER NULL,
+                    last_enqueued_at INTEGER NULL,
+                    first_started_at INTEGER NULL,
+                    last_started_at INTEGER NULL,
+                    last_finished_at INTEGER NULL,
+                    queued_ms_total INTEGER NOT NULL DEFAULT 0,
+                    queued_ms_last INTEGER NULL,
+                    processing_ms_total INTEGER NOT NULL DEFAULT 0,
+                    processing_ms_last INTEGER NULL
                 )"
                 .to_string(),
             ))
             .await?;
+
+        self.ensure_timing_columns().await?;
 
         self.db
             .execute(Statement::from_string(
@@ -296,7 +319,22 @@ where
         let statement = Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE jobs
-             SET status = ?, locked_at = NULL, lock_token = NULL, updated_at = ?
+             SET status = ?,
+                 locked_at = NULL,
+                 lock_token = NULL,
+                 updated_at = ?,
+                 last_enqueued_at = ?,
+                 last_finished_at = ?,
+                 processing_ms_last = CASE
+                     WHEN ? >= COALESCE(last_started_at, locked_at, ?)
+                     THEN (? - COALESCE(last_started_at, locked_at, ?)) * 1000
+                     ELSE 0
+                 END,
+                 processing_ms_total = processing_ms_total + CASE
+                     WHEN ? >= COALESCE(last_started_at, locked_at, ?)
+                     THEN (? - COALESCE(last_started_at, locked_at, ?)) * 1000
+                     ELSE 0
+                 END
              WHERE job_type = ?
                AND status = ?
                AND locked_at IS NOT NULL
@@ -304,6 +342,16 @@ where
                 .to_string(),
             vec![
                 STATUS_QUEUED.into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
                 now.into(),
                 Self::job_type().into(),
                 STATUS_PROCESSING.into(),
@@ -385,7 +433,23 @@ where
     async fn claim_next_job(&self, now: i64) -> Result<Option<ClaimedJob<J>>, QueueError> {
         let lock_token = self.next_lock_token(now);
         let sql = "UPDATE jobs
-                   SET status = ?, attempts = attempts + 1, locked_at = ?, lock_token = ?, updated_at = ?
+                   SET status = ?,
+                       attempts = attempts + 1,
+                       locked_at = ?,
+                       lock_token = ?,
+                       updated_at = ?,
+                       queued_ms_last = CASE
+                           WHEN ? >= COALESCE(last_enqueued_at, ?)
+                           THEN (? - COALESCE(last_enqueued_at, ?)) * 1000
+                           ELSE 0
+                       END,
+                       queued_ms_total = queued_ms_total + CASE
+                           WHEN ? >= COALESCE(last_enqueued_at, ?)
+                           THEN (? - COALESCE(last_enqueued_at, ?)) * 1000
+                           ELSE 0
+                       END,
+                       first_started_at = COALESCE(first_started_at, ?),
+                       last_started_at = ?
                    WHERE id = (
                        SELECT id
                        FROM jobs
@@ -396,7 +460,7 @@ where
                        LIMIT 1
                    )
                    AND status = ?
-                   RETURNING id, payload, attempts, max_attempts";
+                   RETURNING id, payload, attempts, max_attempts, lock_token, last_started_at";
 
         let statement = Statement::from_sql_and_values(
             DbBackend::Sqlite,
@@ -405,6 +469,16 @@ where
                 STATUS_PROCESSING.into(),
                 now.into(),
                 lock_token.clone().into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
+                now.into(),
                 now.into(),
                 Self::job_type().into(),
                 STATUS_QUEUED.into(),
@@ -429,6 +503,12 @@ where
         let max_attempts_raw: i32 = row
             .try_get_by_index(3)
             .map_err(|e| QueueError::RowDecode(format!("{e:?}")))?;
+        let stored_lock_token: Option<String> = row
+            .try_get_by_index(4)
+            .map_err(|e| QueueError::RowDecode(format!("{e:?}")))?;
+        let started_at: Option<i64> = row
+            .try_get_by_index(5)
+            .map_err(|e| QueueError::RowDecode(format!("{e:?}")))?;
 
         let attempts =
             u32::try_from(attempts_raw).map_err(|_| QueueError::InvalidAttempts(attempts_raw))?;
@@ -441,23 +521,41 @@ where
             id,
             attempts,
             max_attempts,
-            lock_token,
+            started_at: started_at.unwrap_or(now),
+            lock_token: stored_lock_token.unwrap_or(lock_token),
             job,
         }))
     }
 
-    async fn mark_completed(&self, job_id: i64, lock_token: &str) -> Result<(), QueueError> {
+    async fn mark_completed(
+        &self,
+        job_id: i64,
+        lock_token: &str,
+        started_at: i64,
+    ) -> Result<(), QueueError> {
         let now = now_epoch_seconds()?;
+        let processing_ms = elapsed_ms(now, started_at);
         let statement = Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE jobs
-             SET status = ?, completed_at = ?, locked_at = NULL, lock_token = NULL, last_error = NULL, updated_at = ?
+             SET status = ?,
+                 completed_at = ?,
+                 locked_at = NULL,
+                 lock_token = NULL,
+                 last_error = NULL,
+                 updated_at = ?,
+                 last_finished_at = ?,
+                 processing_ms_last = ?,
+                 processing_ms_total = processing_ms_total + ?
              WHERE id = ? AND status = ? AND lock_token = ?"
                 .to_string(),
             vec![
                 STATUS_COMPLETED.into(),
                 now.into(),
                 now.into(),
+                now.into(),
+                processing_ms.into(),
+                processing_ms.into(),
                 job_id.into(),
                 STATUS_PROCESSING.into(),
                 lock_token.into(),
@@ -483,8 +581,14 @@ where
         if retry {
             let delay = self.options.backoff.delay_for_attempt(claimed.attempts);
             let next_run_at = now_epoch_seconds()?.saturating_add(duration_to_secs(delay));
-            self.mark_retry(claimed.id, &claimed.lock_token, next_run_at, &error_message)
-                .await?;
+            self.mark_retry(
+                claimed.id,
+                &claimed.lock_token,
+                claimed.started_at,
+                next_run_at,
+                &error_message,
+            )
+            .await?;
 
             Ok(RunOutcome::Retried {
                 job_id: claimed.id,
@@ -493,7 +597,7 @@ where
                 error: error_message,
             })
         } else {
-            self.mark_failed(claimed.id, &claimed.lock_token, &error_message)
+            self.mark_failed(claimed.id, &claimed.lock_token, claimed.started_at, &error_message)
                 .await?;
 
             Ok(RunOutcome::Failed {
@@ -508,14 +612,25 @@ where
         &self,
         job_id: i64,
         lock_token: &str,
+        started_at: i64,
         next_run_at: i64,
         error_message: &str,
     ) -> Result<(), QueueError> {
         let now = now_epoch_seconds()?;
+        let processing_ms = elapsed_ms(now, started_at);
         let statement = Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE jobs
-             SET status = ?, available_at = ?, locked_at = NULL, lock_token = NULL, last_error = ?, updated_at = ?
+             SET status = ?,
+                 available_at = ?,
+                 locked_at = NULL,
+                 lock_token = NULL,
+                 last_error = ?,
+                 updated_at = ?,
+                 last_enqueued_at = ?,
+                 last_finished_at = ?,
+                 processing_ms_last = ?,
+                 processing_ms_total = processing_ms_total + ?
              WHERE id = ? AND status = ? AND lock_token = ?"
                 .to_string(),
             vec![
@@ -523,6 +638,10 @@ where
                 next_run_at.into(),
                 error_message.into(),
                 now.into(),
+                now.into(),
+                now.into(),
+                processing_ms.into(),
+                processing_ms.into(),
                 job_id.into(),
                 STATUS_PROCESSING.into(),
                 lock_token.into(),
@@ -541,19 +660,31 @@ where
         &self,
         job_id: i64,
         lock_token: &str,
+        started_at: i64,
         error_message: &str,
     ) -> Result<(), QueueError> {
         let now = now_epoch_seconds()?;
+        let processing_ms = elapsed_ms(now, started_at);
         let statement = Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE jobs
-             SET status = ?, locked_at = NULL, lock_token = NULL, last_error = ?, updated_at = ?
+             SET status = ?,
+                 locked_at = NULL,
+                 lock_token = NULL,
+                 last_error = ?,
+                 updated_at = ?,
+                 last_finished_at = ?,
+                 processing_ms_last = ?,
+                 processing_ms_total = processing_ms_total + ?
              WHERE id = ? AND status = ? AND lock_token = ?"
                 .to_string(),
             vec![
                 STATUS_FAILED.into(),
                 error_message.into(),
                 now.into(),
+                now.into(),
+                processing_ms.into(),
+                processing_ms.into(),
                 job_id.into(),
                 STATUS_PROCESSING.into(),
                 lock_token.into(),
@@ -576,6 +707,51 @@ where
     fn job_type() -> &'static str {
         std::any::type_name::<J>()
     }
+
+    async fn ensure_timing_columns(&self) -> Result<(), QueueError> {
+        let existing = self.job_columns().await?;
+        for (column, definition) in timing_column_definitions() {
+            if !existing.contains(column) {
+                self.db
+                    .execute(Statement::from_string(
+                        DbBackend::Sqlite,
+                        format!("ALTER TABLE jobs ADD COLUMN {column} {definition}"),
+                    ))
+                    .await?;
+            }
+        }
+
+        self.db
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "UPDATE jobs
+                 SET first_enqueued_at = COALESCE(first_enqueued_at, created_at)"
+                    .to_string(),
+            ))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn job_columns(&self) -> Result<HashSet<String>, QueueError> {
+        let rows = self
+            .db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA table_info(jobs)".to_string(),
+            ))
+            .await?;
+
+        let mut columns = HashSet::with_capacity(rows.len());
+        for row in rows {
+            let column: String = row
+                .try_get_by_index(1)
+                .map_err(|e| QueueError::RowDecode(format!("{e:?}")))?;
+            columns.insert(column);
+        }
+
+        Ok(columns)
+    }
 }
 
 fn make_worker_id() -> String {
@@ -591,10 +767,31 @@ fn duration_to_secs(duration: Duration) -> i64 {
     i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
 }
 
+fn elapsed_ms(now_secs: i64, started_at_secs: i64) -> i64 {
+    now_secs
+        .saturating_sub(started_at_secs)
+        .max(0)
+        .saturating_mul(1_000)
+}
+
 fn non_zero_poll_interval(interval: Duration) -> Duration {
     if interval.is_zero() {
         Duration::from_millis(1)
     } else {
         interval
     }
+}
+
+fn timing_column_definitions() -> [(&'static str, &'static str); 9] {
+    [
+        ("first_enqueued_at", "INTEGER NULL"),
+        ("last_enqueued_at", "INTEGER NULL"),
+        ("first_started_at", "INTEGER NULL"),
+        ("last_started_at", "INTEGER NULL"),
+        ("last_finished_at", "INTEGER NULL"),
+        ("queued_ms_total", "INTEGER NOT NULL DEFAULT 0"),
+        ("queued_ms_last", "INTEGER NULL"),
+        ("processing_ms_total", "INTEGER NOT NULL DEFAULT 0"),
+        ("processing_ms_last", "INTEGER NULL"),
+    ]
 }
