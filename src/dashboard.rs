@@ -154,10 +154,10 @@ async fn fetch_stats(db: &DatabaseConnection) -> DashboardResult<DashboardStats>
         DbBackend::Sqlite,
         "SELECT
              COUNT(*) AS total,
-             SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) AS queued,
-             SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS processing,
-             SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
-             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+             COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued,
+             COALESCE(SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END), 0) AS processing,
+             COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS completed,
+             COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed
          FROM jobs"
             .to_string(),
     );
@@ -197,9 +197,9 @@ async fn fetch_jobs(db: &DatabaseConnection, limit: i64) -> DashboardResult<Vec<
              first_started_at,
              last_started_at,
              last_finished_at,
-             queued_ms_total,
+             COALESCE(queued_ms_total, 0) AS queued_ms_total,
              queued_ms_last,
-             processing_ms_total,
+             COALESCE(processing_ms_total, 0) AS processing_ms_total,
              processing_ms_last
          FROM jobs
          ORDER BY id DESC
@@ -494,6 +494,40 @@ mod tests {
         assert!(html.contains("/api/jobs"));
         assert!(html.contains("<th>Queued</th>"));
         assert!(html.contains("<th>Processed</th>"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_stats_are_zero_for_empty_queue() {
+        let dir = tempdir().unwrap();
+        let db_url = sqlite_url(dir.path().join("queue.db"));
+
+        let processor = SqliteJobProcessor::<DashboardTestJob>::connect(&db_url, test_options())
+            .await
+            .unwrap();
+
+        let app = router(processor.db().clone());
+
+        let stats_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats_response.status(), StatusCode::OK);
+
+        let stats_bytes = to_bytes(stats_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stats: DashboardStats = serde_json::from_slice(&stats_bytes).unwrap();
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.queued, 0);
+        assert_eq!(stats.processing, 0);
+        assert_eq!(stats.completed, 0);
+        assert_eq!(stats.failed, 0);
     }
 
     #[tokio::test]
