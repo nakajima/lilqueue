@@ -154,6 +154,10 @@ where
         &self.db
     }
 
+    pub fn wake_workers(&self) {
+        self.enqueue_notify.notify_waiters();
+    }
+
     pub fn spawn_worker(&self) -> WorkerHandle {
         self.spawn_workers(1)
     }
@@ -250,7 +254,10 @@ where
                 RunOutcome::Idle => {
                     let now = now_epoch_seconds()?;
                     let wake_delay = self.next_wakeup_delay(now).await?;
-                    if self.wait_for_enqueue_or_shutdown_notify(shutdown, wake_delay).await {
+                    if self
+                        .wait_for_enqueue_or_shutdown_notify(shutdown, wake_delay)
+                        .await
+                    {
                         return Ok(());
                     }
                 }
@@ -378,7 +385,7 @@ where
              WHERE job_type = ?
                AND status IN (?, ?)
             "
-                .to_string(),
+            .to_string(),
             vec![
                 STATUS_QUEUED.into(),
                 STATUS_PROCESSING.into(),
@@ -597,8 +604,13 @@ where
                 error: error_message,
             })
         } else {
-            self.mark_failed(claimed.id, &claimed.lock_token, claimed.started_at, &error_message)
-                .await?;
+            self.mark_failed(
+                claimed.id,
+                &claimed.lock_token,
+                claimed.started_at,
+                &error_message,
+            )
+            .await?;
 
             Ok(RunOutcome::Failed {
                 job_id: claimed.id,

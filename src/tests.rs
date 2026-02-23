@@ -93,7 +93,10 @@ async fn processes_successful_job() {
     assert!(timings.last_finished_at.is_some());
     assert!(timings.queued_ms_total >= 0);
     assert!(timings.processing_ms_total >= 0);
-    assert_eq!(timings.queued_ms_total, timings.queued_ms_last.unwrap_or_default());
+    assert_eq!(
+        timings.queued_ms_total,
+        timings.queued_ms_last.unwrap_or_default()
+    );
     assert_eq!(
         timings.processing_ms_total,
         timings.processing_ms_last.unwrap_or_default()
