@@ -1,4 +1,4 @@
-use crate::{Job, JobError, ProcessorOptions, RunOutcome, entity::jobs};
+use crate::{EnqueueOptions, Job, JobError, ProcessorOptions, RunOutcome, entity::jobs};
 use sea_orm::{
     ActiveModelTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend, DbErr, Statement,
 };
@@ -186,13 +186,29 @@ where
     }
 
     pub async fn enqueue(&self, job: &J) -> Result<i64, QueueError> {
-        self.enqueue_with_delay(job, Duration::ZERO).await
+        self.enqueue_with_options(job, EnqueueOptions::default())
+            .await
     }
 
     pub async fn enqueue_with_delay(&self, job: &J, delay: Duration) -> Result<i64, QueueError> {
+        self.enqueue_with_options(
+            job,
+            EnqueueOptions {
+                delay,
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn enqueue_with_options(
+        &self,
+        job: &J,
+        options: EnqueueOptions,
+    ) -> Result<i64, QueueError> {
         let payload = serde_json::to_string(job)?;
         let now = now_epoch_seconds()?;
-        let available_at = now.saturating_add(duration_to_secs(delay));
+        let available_at = now.saturating_add(duration_to_secs(options.delay));
 
         let active = jobs::ActiveModel {
             job_type: sea_orm::Set(Self::job_type().to_string()),
@@ -201,6 +217,7 @@ where
             attempts: sea_orm::Set(0),
             max_attempts: sea_orm::Set(self.options.max_attempts as i32),
             available_at: sea_orm::Set(available_at),
+            priority: sea_orm::Set(options.priority),
             locked_at: sea_orm::Set(None),
             lock_token: sea_orm::Set(None),
             last_error: sea_orm::Set(None),
@@ -250,18 +267,15 @@ where
         shutdown: &tokio::sync::Notify,
     ) -> Result<(), QueueError> {
         loop {
-            match self.run_once().await? {
-                RunOutcome::Idle => {
-                    let now = now_epoch_seconds()?;
-                    let wake_delay = self.next_wakeup_delay(now).await?;
-                    if self
-                        .wait_for_enqueue_or_shutdown_notify(shutdown, wake_delay)
-                        .await
-                    {
-                        return Ok(());
-                    }
+            if self.run_once().await? == RunOutcome::Idle {
+                let now = now_epoch_seconds()?;
+                let wake_delay = self.next_wakeup_delay(now).await?;
+                if self
+                    .wait_for_enqueue_or_shutdown_notify(shutdown, wake_delay)
+                    .await
+                {
+                    return Ok(());
                 }
-                _ => {}
             }
         }
     }
@@ -278,6 +292,7 @@ where
                     attempts INTEGER NOT NULL DEFAULT 0,
                     max_attempts INTEGER NOT NULL,
                     available_at INTEGER NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
                     locked_at INTEGER NULL,
                     lock_token TEXT NULL,
                     last_error TEXT NULL,
@@ -298,13 +313,21 @@ where
             ))
             .await?;
 
-        self.ensure_timing_columns().await?;
+        self.ensure_job_columns().await?;
 
         self.db
             .execute(Statement::from_string(
                 DbBackend::Sqlite,
                 "CREATE INDEX IF NOT EXISTS idx_jobs_ready
                     ON jobs (job_type, status, available_at, id)"
+                    .to_string(),
+            ))
+            .await?;
+        self.db
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "CREATE INDEX IF NOT EXISTS idx_jobs_ready_priority
+                    ON jobs (job_type, status, priority DESC, available_at, id)"
                     .to_string(),
             ))
             .await?;
@@ -463,7 +486,7 @@ where
                        WHERE job_type = ?
                          AND status = ?
                          AND available_at <= ?
-                       ORDER BY available_at ASC, id ASC
+                       ORDER BY priority DESC, available_at ASC, id ASC
                        LIMIT 1
                    )
                    AND status = ?
@@ -720,7 +743,7 @@ where
         std::any::type_name::<J>()
     }
 
-    async fn ensure_timing_columns(&self) -> Result<(), QueueError> {
+    async fn ensure_job_columns(&self) -> Result<(), QueueError> {
         let existing = self.job_columns().await?;
         for (column, definition) in timing_column_definitions() {
             if !existing.contains(column) {
@@ -732,12 +755,24 @@ where
                     .await?;
             }
         }
+        if !existing.contains(PRIORITY_COLUMN.0) {
+            self.db
+                .execute(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!(
+                        "ALTER TABLE jobs ADD COLUMN {} {}",
+                        PRIORITY_COLUMN.0, PRIORITY_COLUMN.1
+                    ),
+                ))
+                .await?;
+        }
 
         self.db
             .execute(Statement::from_string(
                 DbBackend::Sqlite,
                 "UPDATE jobs
-                 SET first_enqueued_at = COALESCE(first_enqueued_at, created_at)"
+                 SET first_enqueued_at = COALESCE(first_enqueued_at, created_at),
+                     priority = COALESCE(priority, 0)"
                     .to_string(),
             ))
             .await?;
@@ -793,6 +828,8 @@ fn non_zero_poll_interval(interval: Duration) -> Duration {
         interval
     }
 }
+
+const PRIORITY_COLUMN: (&str, &str) = ("priority", "INTEGER NOT NULL DEFAULT 0");
 
 fn timing_column_definitions() -> [(&'static str, &'static str); 9] {
     [

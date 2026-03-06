@@ -10,7 +10,7 @@ jobs are plain `serde`-serializable structs that implement a single-method trait
 
 ```rust
 use async_trait::async_trait;
-use lilqueue::{Job, JobError, ProcessorOptions, SqliteJobProcessor};
+use lilqueue::{EnqueueOptions, Job, JobError, ProcessorOptions, SqliteJobProcessor};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -36,10 +36,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker = processor.spawn_worker();
 
     processor
-        .enqueue(&EmailJob {
-            to: "user@example.com".into(),
-            body: "hello".into(),
-        })
+        .enqueue_with_options(
+            &EmailJob {
+                to: "user@example.com".into(),
+                body: "hello".into(),
+            },
+            EnqueueOptions {
+                // Higher number is higher priority. Default is 0.
+                priority: 10,
+                ..EnqueueOptions::default()
+            },
+        )
         .await?;
 
     tokio::time::sleep(Duration::from_millis(200)).await;

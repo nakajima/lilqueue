@@ -12,6 +12,7 @@ pub mod jobs {
         pub attempts: i32,
         pub max_attempts: i32,
         pub available_at: i64,
+        pub priority: i32,
         pub locked_at: Option<i64>,
         pub lock_token: Option<String>,
         pub last_error: Option<String>,

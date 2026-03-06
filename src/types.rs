@@ -52,6 +52,21 @@ impl Default for ProcessorOptions {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct EnqueueOptions {
+    pub delay: Duration,
+    pub priority: i32,
+}
+
+impl Default for EnqueueOptions {
+    fn default() -> Self {
+        Self {
+            delay: Duration::ZERO,
+            priority: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum JobError {
     #[error("{0}")]

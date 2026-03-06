@@ -315,7 +315,7 @@ async fn initialize_schema_adds_timing_columns_for_existing_table() {
         .db()
         .query_one(Statement::from_string(
             DbBackend::Sqlite,
-            "SELECT first_enqueued_at, queued_ms_total, processing_ms_total FROM jobs WHERE id = 1"
+            "SELECT first_enqueued_at, queued_ms_total, processing_ms_total, priority FROM jobs WHERE id = 1"
                 .to_string(),
         ))
         .await
@@ -325,9 +325,101 @@ async fn initialize_schema_adds_timing_columns_for_existing_table() {
     let first_enqueued_at: Option<i64> = row.try_get_by_index(0).unwrap();
     let queued_ms_total: i64 = row.try_get_by_index(1).unwrap();
     let processing_ms_total: i64 = row.try_get_by_index(2).unwrap();
+    let priority: i32 = row.try_get_by_index(3).unwrap();
     assert_eq!(first_enqueued_at, Some(42));
     assert_eq!(queued_ms_total, 0);
     assert_eq!(processing_ms_total, 0);
+    assert_eq!(priority, 0);
+}
+
+#[tokio::test]
+async fn enqueue_with_options_persists_priority() {
+    let dir = tempdir().unwrap();
+    let db_url = sqlite_url(dir.path().join("queue.db"));
+
+    let processor = SqliteJobProcessor::<WriteFileJob>::connect(&db_url, test_options())
+        .await
+        .unwrap();
+
+    let output_path = dir.path().join("priority.log");
+    let job_id = processor
+        .enqueue_with_options(
+            &WriteFileJob {
+                output_path: output_path.to_string_lossy().to_string(),
+                line: "priority".to_string(),
+            },
+            EnqueueOptions {
+                priority: 7,
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let row = processor
+        .db()
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT priority FROM jobs WHERE id = ?".to_string(),
+            vec![job_id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let priority: i32 = row.try_get_by_index(0).unwrap();
+    assert_eq!(priority, 7);
+}
+
+#[tokio::test]
+async fn claims_higher_priority_jobs_first() {
+    let dir = tempdir().unwrap();
+    let db_url = sqlite_url(dir.path().join("queue.db"));
+
+    let processor = SqliteJobProcessor::<WriteFileJob>::connect(&db_url, test_options())
+        .await
+        .unwrap();
+
+    let output_path = dir.path().join("ordered.log");
+    let low_id = processor
+        .enqueue_with_options(
+            &WriteFileJob {
+                output_path: output_path.to_string_lossy().to_string(),
+                line: "low".to_string(),
+            },
+            EnqueueOptions {
+                priority: 0,
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let high_id = processor
+        .enqueue_with_options(
+            &WriteFileJob {
+                output_path: output_path.to_string_lossy().to_string(),
+                line: "high".to_string(),
+            },
+            EnqueueOptions {
+                priority: 10,
+                ..EnqueueOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let first = processor.run_once().await.unwrap();
+    let first_id = match first {
+        RunOutcome::Completed { job_id, .. } => job_id,
+        outcome => panic!("unexpected first run outcome: {outcome:?}"),
+    };
+    assert_eq!(first_id, high_id);
+
+    let second = processor.run_once().await.unwrap();
+    let second_id = match second {
+        RunOutcome::Completed { job_id, .. } => job_id,
+        outcome => panic!("unexpected second run outcome: {outcome:?}"),
+    };
+    assert_eq!(second_id, low_id);
 }
 
 #[tokio::test]

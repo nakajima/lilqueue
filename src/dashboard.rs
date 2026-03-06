@@ -53,6 +53,7 @@ pub struct DashboardJob {
     pub attempts: i32,
     pub max_attempts: i32,
     pub available_at: i64,
+    pub priority: i32,
     pub locked_at: Option<i64>,
     pub last_error: Option<String>,
     pub created_at: i64,
@@ -284,6 +285,7 @@ async fn fetch_jobs(db: &DatabaseConnection, limit: i64) -> DashboardResult<Vec<
              attempts,
              max_attempts,
              available_at,
+             priority,
              locked_at,
              last_error,
              created_at,
@@ -317,20 +319,21 @@ async fn fetch_jobs(db: &DatabaseConnection, limit: i64) -> DashboardResult<Vec<
             attempts: try_get_by_index::<i32>(&row, 4)?,
             max_attempts: try_get_by_index::<i32>(&row, 5)?,
             available_at: try_get_by_index::<i64>(&row, 6)?,
-            locked_at: try_get_by_index::<Option<i64>>(&row, 7)?,
-            last_error: try_get_by_index::<Option<String>>(&row, 8)?,
-            created_at: try_get_by_index::<i64>(&row, 9)?,
-            updated_at: try_get_by_index::<i64>(&row, 10)?,
-            completed_at: try_get_by_index::<Option<i64>>(&row, 11)?,
-            first_enqueued_at: try_get_by_index::<Option<i64>>(&row, 12)?,
-            last_enqueued_at: try_get_by_index::<Option<i64>>(&row, 13)?,
-            first_started_at: try_get_by_index::<Option<i64>>(&row, 14)?,
-            last_started_at: try_get_by_index::<Option<i64>>(&row, 15)?,
-            last_finished_at: try_get_by_index::<Option<i64>>(&row, 16)?,
-            queued_ms_total: try_get_by_index::<i64>(&row, 17)?,
-            queued_ms_last: try_get_by_index::<Option<i64>>(&row, 18)?,
-            processing_ms_total: try_get_by_index::<i64>(&row, 19)?,
-            processing_ms_last: try_get_by_index::<Option<i64>>(&row, 20)?,
+            priority: try_get_by_index::<i32>(&row, 7)?,
+            locked_at: try_get_by_index::<Option<i64>>(&row, 8)?,
+            last_error: try_get_by_index::<Option<String>>(&row, 9)?,
+            created_at: try_get_by_index::<i64>(&row, 10)?,
+            updated_at: try_get_by_index::<i64>(&row, 11)?,
+            completed_at: try_get_by_index::<Option<i64>>(&row, 12)?,
+            first_enqueued_at: try_get_by_index::<Option<i64>>(&row, 13)?,
+            last_enqueued_at: try_get_by_index::<Option<i64>>(&row, 14)?,
+            first_started_at: try_get_by_index::<Option<i64>>(&row, 15)?,
+            last_started_at: try_get_by_index::<Option<i64>>(&row, 16)?,
+            last_finished_at: try_get_by_index::<Option<i64>>(&row, 17)?,
+            queued_ms_total: try_get_by_index::<i64>(&row, 18)?,
+            queued_ms_last: try_get_by_index::<Option<i64>>(&row, 19)?,
+            processing_ms_total: try_get_by_index::<i64>(&row, 20)?,
+            processing_ms_last: try_get_by_index::<Option<i64>>(&row, 21)?,
         });
     }
 
@@ -393,9 +396,11 @@ fn render_dashboard_html(
             job.processing_ms_total,
             job.processing_ms_last,
         ));
+        let priority = job.priority;
 
         rows.push_str(&format!(
             "<tr>\
+                <td>{}</td>\
                 <td>{}</td>\
                 <td>{}</td>\
                 <td>{}</td>\
@@ -408,6 +413,7 @@ fn render_dashboard_html(
             job.id,
             job_type,
             status,
+            priority,
             job.attempts,
             job.max_attempts,
             queued,
@@ -494,7 +500,7 @@ fn render_dashboard_html(
            </section>\
            <table>\
              <thead>\
-               <tr><th>ID</th><th>Type</th><th>Status</th><th>Attempts</th><th>Queued</th><th>Processed</th><th>Payload</th><th>Last error</th></tr>\
+               <tr><th>ID</th><th>Type</th><th>Status</th><th>Priority</th><th>Attempts</th><th>Queued</th><th>Processed</th><th>Payload</th><th>Last error</th></tr>\
              </thead>\
              <tbody>{}</tbody>\
            </table>\
@@ -684,6 +690,7 @@ mod tests {
         let html = String::from_utf8(index_bytes.to_vec()).unwrap();
         assert!(html.contains("lilqueue dashboard"));
         assert!(html.contains("/api/jobs"));
+        assert!(html.contains("<th>Priority</th>"));
         assert!(html.contains("<th>Queued</th>"));
         assert!(html.contains("<th>Processed</th>"));
     }
