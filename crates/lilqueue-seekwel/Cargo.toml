@@ -1,0 +1,21 @@
+[package]
+name = "lilqueue-seekwel"
+version = "0.1.0"
+edition = "2024"
+description = "Seekwel adapter for lilqueue"
+license = "BSD-3-Clause"
+repository = "https://github.com/nakajima/lilqueue"
+readme = "README.md"
+keywords = ["jobs", "queue", "seekwel", "sqlite"]
+categories = ["asynchronous", "database"]
+
+[dependencies]
+async-trait = "0.1"
+lilqueue = { path = "../..", version = "0.1.0" }
+rusqlite = "0.39"
+seekwel = { version = "0.1.16", features = ["tokio"] }
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

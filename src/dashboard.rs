@@ -1,3 +1,5 @@
+use crate::BoxError;
+use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::{OriginalUri, Query, State},
@@ -5,7 +7,6 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, QueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -27,9 +28,15 @@ impl Default for DashboardOptions {
     }
 }
 
+#[async_trait]
+pub trait DashboardData: Clone + Send + Sync + 'static {
+    async fn dashboard_stats(&self) -> Result<DashboardStats, BoxError>;
+    async fn dashboard_jobs(&self, limit: i64) -> Result<Vec<DashboardJob>, BoxError>;
+}
+
 #[derive(Clone)]
-struct DashboardState {
-    db: DatabaseConnection,
+struct DashboardState<D> {
+    data: D,
     options: DashboardOptions,
     control: Option<Arc<dyn DashboardControl>>,
 }
@@ -93,7 +100,7 @@ pub struct DashboardWakeResult {
     pub result: String,
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 pub trait DashboardControl: Send + Sync + 'static {
     async fn wake_workers(&self) -> Result<DashboardWakeResult, String>;
     async fn runtime_state(&self) -> Result<DashboardRuntimeState, String>;
@@ -106,10 +113,8 @@ struct ErrorResponse {
 
 #[derive(Debug, thiserror::Error)]
 enum DashboardError {
-    #[error("database error: {0}")]
-    Database(#[from] DbErr),
-    #[error("row decode error: {0}")]
-    RowDecode(String),
+    #[error("dashboard data error: {0}")]
+    Data(#[from] BoxError),
     #[error("dashboard control is not configured")]
     ControlUnavailable,
     #[error("dashboard control error: {0}")]
@@ -134,49 +139,64 @@ impl IntoResponse for DashboardError {
 
 type DashboardResult<T> = Result<T, DashboardError>;
 
-pub fn router(db: DatabaseConnection) -> Router {
-    router_with_options(db, DashboardOptions::default())
+pub fn router<D>(data: D) -> Router
+where
+    D: DashboardData,
+{
+    router_with_options(data, DashboardOptions::default())
 }
 
-pub fn router_with_options(db: DatabaseConnection, options: DashboardOptions) -> Router {
-    router_with_options_and_control(db, options, None)
+pub fn router_with_options<D>(data: D, options: DashboardOptions) -> Router
+where
+    D: DashboardData,
+{
+    router_with_options_and_control(data, options, None)
 }
 
-pub fn router_with_control(
-    db: DatabaseConnection,
+pub fn router_with_control<D>(
+    data: D,
     options: DashboardOptions,
     control: Arc<dyn DashboardControl>,
-) -> Router {
-    router_with_options_and_control(db, options, Some(control))
+) -> Router
+where
+    D: DashboardData,
+{
+    router_with_options_and_control(data, options, Some(control))
 }
 
-fn router_with_options_and_control(
-    db: DatabaseConnection,
+fn router_with_options_and_control<D>(
+    data: D,
     options: DashboardOptions,
     control: Option<Arc<dyn DashboardControl>>,
-) -> Router {
+) -> Router
+where
+    D: DashboardData,
+{
     let state = DashboardState {
-        db,
+        data,
         options,
         control,
     };
 
     Router::new()
-        .route("/", get(index))
-        .route("/api/stats", get(stats))
-        .route("/api/jobs", get(jobs))
-        .route("/api/state", get(runtime_state))
-        .route("/api/control/wake", post(wake_workers))
+        .route("/", get(index::<D>))
+        .route("/api/stats", get(stats::<D>))
+        .route("/api/jobs", get(jobs::<D>))
+        .route("/api/state", get(runtime_state::<D>))
+        .route("/api/control/wake", post(wake_workers::<D>))
         .with_state(state)
 }
 
-async fn index(
-    State(state): State<DashboardState>,
+async fn index<D>(
+    State(state): State<DashboardState<D>>,
     OriginalUri(uri): OriginalUri,
-) -> DashboardResult<Html<String>> {
+) -> DashboardResult<Html<String>>
+where
+    D: DashboardData,
+{
     let limit = resolve_limit(None, &state.options);
-    let stats = fetch_stats(&state.db).await?;
-    let jobs = fetch_jobs(&state.db, limit).await?;
+    let stats = state.data.dashboard_stats().await?;
+    let jobs = state.data.dashboard_jobs(limit).await?;
     let stats_path = api_path(uri.path(), "stats");
     let jobs_path = api_path(uri.path(), "jobs");
     let state_path = api_path(uri.path(), "state");
@@ -202,23 +222,32 @@ async fn index(
     )))
 }
 
-async fn stats(State(state): State<DashboardState>) -> DashboardResult<Json<DashboardStats>> {
-    let stats = fetch_stats(&state.db).await?;
+async fn stats<D>(State(state): State<DashboardState<D>>) -> DashboardResult<Json<DashboardStats>>
+where
+    D: DashboardData,
+{
+    let stats = state.data.dashboard_stats().await?;
     Ok(Json(stats))
 }
 
-async fn jobs(
-    State(state): State<DashboardState>,
+async fn jobs<D>(
+    State(state): State<DashboardState<D>>,
     Query(query): Query<JobsQuery>,
-) -> DashboardResult<Json<JobsResponse>> {
+) -> DashboardResult<Json<JobsResponse>>
+where
+    D: DashboardData,
+{
     let limit = resolve_limit(query.limit, &state.options);
-    let jobs = fetch_jobs(&state.db, limit).await?;
+    let jobs = state.data.dashboard_jobs(limit).await?;
     Ok(Json(JobsResponse { jobs }))
 }
 
-async fn runtime_state(
-    State(state): State<DashboardState>,
-) -> DashboardResult<Json<DashboardRuntimeState>> {
+async fn runtime_state<D>(
+    State(state): State<DashboardState<D>>,
+) -> DashboardResult<Json<DashboardRuntimeState>>
+where
+    D: DashboardData,
+{
     let Some(control) = state.control else {
         return Err(DashboardError::ControlUnavailable);
     };
@@ -229,10 +258,13 @@ async fn runtime_state(
     Ok(Json(runtime_state))
 }
 
-async fn wake_workers(
-    State(state): State<DashboardState>,
+async fn wake_workers<D>(
+    State(state): State<DashboardState<D>>,
     OriginalUri(uri): OriginalUri,
-) -> DashboardResult<Response> {
+) -> DashboardResult<Response>
+where
+    D: DashboardData,
+{
     let Some(control) = state.control else {
         return Err(DashboardError::ControlUnavailable);
     };
@@ -242,99 +274,6 @@ async fn wake_workers(
         .map_err(DashboardError::Control)?;
     let location = index_path_from_api(uri.path(), "control/wake");
     Ok(Redirect::to(&location).into_response())
-}
-
-async fn fetch_stats(db: &DatabaseConnection) -> DashboardResult<DashboardStats> {
-    let statement = Statement::from_string(
-        DbBackend::Sqlite,
-        "SELECT
-             COUNT(*) AS total,
-             COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued,
-             COALESCE(SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END), 0) AS processing,
-             COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS completed,
-             COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
-             COALESCE(SUM(CASE WHEN status = 'cleared' THEN 1 ELSE 0 END), 0) AS cleared
-         FROM jobs"
-            .to_string(),
-    );
-
-    let row = db
-        .query_one(statement)
-        .await?
-        .ok_or_else(|| DashboardError::RowDecode("no row returned".to_string()))?;
-
-    Ok(DashboardStats {
-        total: try_get_by_index::<i64>(&row, 0)?,
-        queued: try_get_by_index::<i64>(&row, 1)?,
-        processing: try_get_by_index::<i64>(&row, 2)?,
-        completed: try_get_by_index::<i64>(&row, 3)?,
-        failed: try_get_by_index::<i64>(&row, 4)?,
-        cleared: try_get_by_index::<i64>(&row, 5)?,
-    })
-}
-
-async fn fetch_jobs(db: &DatabaseConnection, limit: i64) -> DashboardResult<Vec<DashboardJob>> {
-    let statement = Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "SELECT
-             id,
-             job_type,
-             status,
-             payload,
-             attempts,
-             max_attempts,
-             available_at,
-             locked_at,
-             last_error,
-             created_at,
-             updated_at,
-             completed_at,
-             first_enqueued_at,
-             last_enqueued_at,
-             first_started_at,
-             last_started_at,
-             last_finished_at,
-             COALESCE(queued_ms_total, 0) AS queued_ms_total,
-             queued_ms_last,
-             COALESCE(processing_ms_total, 0) AS processing_ms_total,
-             processing_ms_last
-         FROM jobs
-         ORDER BY id DESC
-         LIMIT ?"
-            .to_string(),
-        vec![limit.into()],
-    );
-
-    let rows = db.query_all(statement).await?;
-    let mut jobs = Vec::with_capacity(rows.len());
-
-    for row in rows {
-        jobs.push(DashboardJob {
-            id: try_get_by_index::<i64>(&row, 0)?,
-            job_type: try_get_by_index::<String>(&row, 1)?,
-            status: try_get_by_index::<String>(&row, 2)?,
-            payload: try_get_by_index::<String>(&row, 3)?,
-            attempts: try_get_by_index::<i32>(&row, 4)?,
-            max_attempts: try_get_by_index::<i32>(&row, 5)?,
-            available_at: try_get_by_index::<i64>(&row, 6)?,
-            locked_at: try_get_by_index::<Option<i64>>(&row, 7)?,
-            last_error: try_get_by_index::<Option<String>>(&row, 8)?,
-            created_at: try_get_by_index::<i64>(&row, 9)?,
-            updated_at: try_get_by_index::<i64>(&row, 10)?,
-            completed_at: try_get_by_index::<Option<i64>>(&row, 11)?,
-            first_enqueued_at: try_get_by_index::<Option<i64>>(&row, 12)?,
-            last_enqueued_at: try_get_by_index::<Option<i64>>(&row, 13)?,
-            first_started_at: try_get_by_index::<Option<i64>>(&row, 14)?,
-            last_started_at: try_get_by_index::<Option<i64>>(&row, 15)?,
-            last_finished_at: try_get_by_index::<Option<i64>>(&row, 16)?,
-            queued_ms_total: try_get_by_index::<i64>(&row, 17)?,
-            queued_ms_last: try_get_by_index::<Option<i64>>(&row, 18)?,
-            processing_ms_total: try_get_by_index::<i64>(&row, 19)?,
-            processing_ms_last: try_get_by_index::<Option<i64>>(&row, 20)?,
-        });
-    }
-
-    Ok(jobs)
 }
 
 fn resolve_limit(limit: Option<u64>, options: &DashboardOptions) -> i64 {
@@ -363,14 +302,6 @@ fn index_path_from_api(path: &str, endpoint: &str) -> String {
     } else {
         prefix.to_string()
     }
-}
-
-fn try_get_by_index<T>(row: &QueryResult, index: usize) -> DashboardResult<T>
-where
-    T: sea_orm::TryGetable,
-{
-    row.try_get_by_index(index)
-        .map_err(|e| DashboardError::RowDecode(format!("{e:?}")))
 }
 
 fn render_dashboard_html(
@@ -550,33 +481,32 @@ fn format_timing_ms(total: i64, last: Option<i64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Job, JobError, ProcessorOptions, SqliteJobProcessor};
-    use async_trait::async_trait;
     use axum::{
         Router,
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use std::{
-        path::Path,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        time::Duration,
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
-    use tempfile::tempdir;
     use tower::util::ServiceExt;
 
-    #[derive(Debug, Serialize, Deserialize)]
-    struct DashboardTestJob {
-        value: String,
+    #[derive(Clone)]
+    struct MockDashboardData {
+        stats: DashboardStats,
+        jobs: Vec<DashboardJob>,
     }
 
     #[async_trait]
-    impl Job for DashboardTestJob {
-        async fn process(&self) -> Result<(), JobError> {
-            Ok(())
+    impl DashboardData for MockDashboardData {
+        async fn dashboard_stats(&self) -> Result<DashboardStats, BoxError> {
+            Ok(self.stats.clone())
+        }
+
+        async fn dashboard_jobs(&self, limit: i64) -> Result<Vec<DashboardJob>, BoxError> {
+            let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+            Ok(self.jobs.iter().take(limit).cloned().collect())
         }
     }
 
@@ -607,27 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_routes_return_stats_and_jobs() {
-        let dir = tempdir().unwrap();
-        let db_url = sqlite_url(dir.path().join("queue.db"));
-
-        let processor = SqliteJobProcessor::<DashboardTestJob>::connect(&db_url, test_options())
-            .await
-            .unwrap();
-
-        processor
-            .enqueue(&DashboardTestJob {
-                value: "first".to_string(),
-            })
-            .await
-            .unwrap();
-        processor
-            .enqueue(&DashboardTestJob {
-                value: "second".to_string(),
-            })
-            .await
-            .unwrap();
-
-        let app = router(processor.db().clone());
+        let app = router(mock_data_with_jobs());
 
         let stats_response = app
             .clone()
@@ -667,10 +577,7 @@ mod tests {
             .unwrap();
         let jobs: JobsResponse = serde_json::from_slice(&jobs_bytes).unwrap();
         assert_eq!(jobs.jobs.len(), 1);
-        assert!(jobs.jobs[0].first_enqueued_at.is_some());
-        assert!(jobs.jobs[0].last_enqueued_at.is_some());
-        assert!(jobs.jobs[0].queued_ms_total >= 0);
-        assert!(jobs.jobs[0].processing_ms_total >= 0);
+        assert_eq!(jobs.jobs[0].payload, "second");
 
         let index_response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -690,17 +597,19 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_stats_are_zero_for_empty_queue() {
-        let dir = tempdir().unwrap();
-        let db_url = sqlite_url(dir.path().join("queue.db"));
-
-        let processor = SqliteJobProcessor::<DashboardTestJob>::connect(&db_url, test_options())
-            .await
-            .unwrap();
-
-        let app = router(processor.db().clone());
+        let app = router(MockDashboardData {
+            stats: DashboardStats {
+                total: 0,
+                queued: 0,
+                processing: 0,
+                completed: 0,
+                failed: 0,
+                cleared: 0,
+            },
+            jobs: Vec::new(),
+        });
 
         let stats_response = app
-            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/stats")
@@ -725,20 +634,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_index_links_respect_mount_path() {
-        let dir = tempdir().unwrap();
-        let db_url = sqlite_url(dir.path().join("queue.db"));
-
-        let processor = SqliteJobProcessor::<DashboardTestJob>::connect(&db_url, test_options())
-            .await
-            .unwrap();
-        processor
-            .enqueue(&DashboardTestJob {
-                value: "first".to_string(),
-            })
-            .await
-            .unwrap();
-
-        let app = Router::new().nest("/queue", router(processor.db().clone()));
+        let app = Router::new().nest("/queue", router(mock_data_with_jobs()));
 
         let index_response = app
             .oneshot(
@@ -761,18 +657,12 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_control_routes_render_and_wake() {
-        let dir = tempdir().unwrap();
-        let db_url = sqlite_url(dir.path().join("queue.db"));
-        let processor = SqliteJobProcessor::<DashboardTestJob>::connect(&db_url, test_options())
-            .await
-            .unwrap();
-
         let wake_calls = Arc::new(AtomicUsize::new(0));
         let control = MockDashboardControl {
             wake_calls: Arc::clone(&wake_calls),
         };
         let app = router_with_control(
-            processor.db().clone(),
+            mock_data_with_jobs(),
             DashboardOptions::default(),
             Arc::new(control),
         );
@@ -824,16 +714,43 @@ mod tests {
         assert_eq!(wake_calls.load(Ordering::SeqCst), 1);
     }
 
-    fn test_options() -> ProcessorOptions {
-        ProcessorOptions {
-            max_attempts: 3,
-            lock_timeout: Duration::from_secs(30),
-            poll_interval: Duration::from_millis(1),
-            backoff: crate::BackoffStrategy::Fixed(Duration::ZERO),
+    fn mock_data_with_jobs() -> MockDashboardData {
+        MockDashboardData {
+            stats: DashboardStats {
+                total: 2,
+                queued: 2,
+                processing: 0,
+                completed: 0,
+                failed: 0,
+                cleared: 0,
+            },
+            jobs: vec![dashboard_job(2, "second"), dashboard_job(1, "first")],
         }
     }
 
-    fn sqlite_url(path: impl AsRef<Path>) -> String {
-        format!("sqlite://{}?mode=rwc", path.as_ref().display())
+    fn dashboard_job(id: i64, payload: &str) -> DashboardJob {
+        DashboardJob {
+            id,
+            job_type: "test-job".to_string(),
+            status: "queued".to_string(),
+            payload: payload.to_string(),
+            attempts: 0,
+            max_attempts: 3,
+            available_at: 100,
+            locked_at: None,
+            last_error: None,
+            created_at: 100,
+            updated_at: 100,
+            completed_at: None,
+            first_enqueued_at: Some(100),
+            last_enqueued_at: Some(100),
+            first_started_at: None,
+            last_started_at: None,
+            last_finished_at: None,
+            queued_ms_total: 0,
+            queued_ms_last: None,
+            processing_ms_total: 0,
+            processing_ms_last: None,
+        }
     }
 }

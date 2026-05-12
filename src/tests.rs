@@ -1,10 +1,8 @@
 use super::*;
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
 use std::{
     fs,
-    path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tempfile::tempdir;
@@ -59,11 +57,8 @@ impl Job for FlakyJob {
 #[tokio::test]
 async fn processes_successful_job() {
     let dir = tempdir().unwrap();
-    let db_url = sqlite_url(dir.path().join("queue.db"));
-
-    let processor = SqliteJobProcessor::<WriteFileJob>::connect(&db_url, test_options())
-        .await
-        .unwrap();
+    let queue = MemoryQueue::default();
+    let processor = JobProcessor::<WriteFileJob, _>::new(queue.clone(), test_options());
 
     let output_path = dir.path().join("output.log");
     let job = WriteFileJob {
@@ -84,23 +79,7 @@ async fn processes_successful_job() {
 
     let file_contents = fs::read_to_string(output_path).unwrap();
     assert!(file_contents.contains("hello"));
-
-    let timings = load_timing_row(processor.db(), id).await;
-    assert!(timings.first_enqueued_at.is_some());
-    assert!(timings.last_enqueued_at.is_some());
-    assert!(timings.first_started_at.is_some());
-    assert!(timings.last_started_at.is_some());
-    assert!(timings.last_finished_at.is_some());
-    assert!(timings.queued_ms_total >= 0);
-    assert!(timings.processing_ms_total >= 0);
-    assert_eq!(
-        timings.queued_ms_total,
-        timings.queued_ms_last.unwrap_or_default()
-    );
-    assert_eq!(
-        timings.processing_ms_total,
-        timings.processing_ms_last.unwrap_or_default()
-    );
+    assert_eq!(queue.job(id).status, MemoryStatus::Completed);
 
     let idle = processor.run_once().await.unwrap();
     assert_eq!(idle, RunOutcome::Idle);
@@ -109,15 +88,13 @@ async fn processes_successful_job() {
 #[tokio::test]
 async fn retries_and_then_completes() {
     let dir = tempdir().unwrap();
-    let db_url = sqlite_url(dir.path().join("queue.db"));
+    let queue = MemoryQueue::default();
 
     let mut options = test_options();
     options.max_attempts = 5;
     options.backoff = BackoffStrategy::Fixed(Duration::ZERO);
 
-    let processor = SqliteJobProcessor::<FlakyJob>::connect(&db_url, options)
-        .await
-        .unwrap();
+    let processor = JobProcessor::<FlakyJob, _>::new(queue.clone(), options);
 
     let state_path = dir.path().join("attempt.txt");
     let job = FlakyJob {
@@ -125,70 +102,22 @@ async fn retries_and_then_completes() {
         succeed_on_attempt: 2,
     };
 
-    processor.enqueue(&job).await.unwrap();
+    let job_id = processor.enqueue(&job).await.unwrap();
 
     let first = processor.run_once().await.unwrap();
     assert!(matches!(first, RunOutcome::Retried { attempts: 1, .. }));
+    assert_eq!(queue.job(job_id).status, MemoryStatus::Queued);
+    assert_eq!(
+        queue.job(job_id).last_error.as_deref(),
+        Some("transient failure")
+    );
 
     let second = processor.run_once().await.unwrap();
     assert!(matches!(second, RunOutcome::Completed { attempts: 2, .. }));
-
-    let job_id = match second {
-        RunOutcome::Completed { job_id, .. } => job_id,
-        _ => unreachable!(),
-    };
-    let timings = load_timing_row(processor.db(), job_id).await;
-    assert!(timings.queued_ms_total >= timings.queued_ms_last.unwrap_or_default());
-    assert!(timings.processing_ms_total >= timings.processing_ms_last.unwrap_or_default());
-    assert!(timings.processing_ms_total >= 0);
+    assert_eq!(queue.job(job_id).status, MemoryStatus::Completed);
 
     let attempts_file = fs::read_to_string(state_path).unwrap();
     assert_eq!(attempts_file.trim(), "2");
-}
-
-#[tokio::test]
-async fn reclaims_stale_processing_job_after_crash() {
-    let dir = tempdir().unwrap();
-    let db_url = sqlite_url(dir.path().join("queue.db"));
-
-    let mut options = test_options();
-    options.lock_timeout = Duration::from_secs(1);
-    let processor = SqliteJobProcessor::<WriteFileJob>::connect(&db_url, options)
-        .await
-        .unwrap();
-
-    let output_path = dir.path().join("stale.log");
-    let job = WriteFileJob {
-        output_path: output_path.to_string_lossy().to_string(),
-        line: "recovered".to_string(),
-    };
-    let job_id = processor.enqueue(&job).await.unwrap();
-
-    let stale_time = current_epoch_seconds().saturating_sub(60);
-    processor
-        .db()
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE jobs SET status = ?, locked_at = ?, lock_token = ? WHERE id = ?".to_string(),
-            vec![
-                "processing".into(),
-                stale_time.into(),
-                "dead-worker".into(),
-                job_id.into(),
-            ],
-        ))
-        .await
-        .unwrap();
-
-    let outcome = processor.run_once().await.unwrap();
-    assert!(matches!(outcome, RunOutcome::Completed { job_id: id, .. } if id == job_id));
-
-    let timings = load_timing_row(processor.db(), job_id).await;
-    assert!(timings.processing_ms_total >= 59_000);
-    assert!(timings.last_enqueued_at.is_some());
-
-    let file_contents = fs::read_to_string(output_path).unwrap();
-    assert!(file_contents.contains("recovered"));
 }
 
 #[tokio::test]
@@ -203,11 +132,8 @@ async fn fails_permanent_job_without_retry() {
         }
     }
 
-    let dir = tempdir().unwrap();
-    let db_url = sqlite_url(dir.path().join("queue.db"));
-    let processor = SqliteJobProcessor::<PermanentFailJob>::connect(&db_url, test_options())
-        .await
-        .unwrap();
+    let queue = MemoryQueue::default();
+    let processor = JobProcessor::<PermanentFailJob, _>::new(queue.clone(), test_options());
 
     let job_id = processor.enqueue(&PermanentFailJob).await.unwrap();
     let outcome = processor.run_once().await.unwrap();
@@ -220,127 +146,41 @@ async fn fails_permanent_job_without_retry() {
             error: "bad payload".to_string(),
         }
     );
+    assert_eq!(queue.job(job_id).status, MemoryStatus::Failed);
 }
 
 #[tokio::test]
-async fn connect_path_works() {
+async fn delayed_job_is_not_claimed_until_available() {
     let dir = tempdir().unwrap();
-    let processor = SqliteJobProcessor::<WriteFileJob>::connect_path(
-        dir.path().join("queue.db"),
-        test_options(),
-    )
-    .await
-    .unwrap();
+    let queue = MemoryQueue::default();
+    let processor = JobProcessor::<WriteFileJob, _>::new(queue.clone(), test_options());
 
-    let db = Database::connect(&sqlite_url(dir.path().join("queue.db")))
-        .await
-        .unwrap();
-    let count = db
-        .query_one(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT COUNT(*) as count FROM jobs".to_string(),
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get_by_index::<i64>(0)
-        .unwrap();
-
-    assert_eq!(count, 0);
-    drop(processor);
-}
-
-#[tokio::test]
-async fn initialize_schema_adds_timing_columns_for_existing_table() {
-    let dir = tempdir().unwrap();
-    let db_url = sqlite_url(dir.path().join("queue.db"));
-    let db = Database::connect(&db_url).await.unwrap();
-
-    db.execute(Statement::from_string(
-        DbBackend::Sqlite,
-        "DROP TABLE IF EXISTS jobs".to_string(),
-    ))
-    .await
-    .unwrap();
-
-    db.execute(Statement::from_string(
-        DbBackend::Sqlite,
-        "CREATE TABLE jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_type TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            status TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            max_attempts INTEGER NOT NULL,
-            available_at INTEGER NOT NULL,
-            locked_at INTEGER NULL,
-            lock_token TEXT NULL,
-            last_error TEXT NULL,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            completed_at INTEGER NULL
-        )"
-        .to_string(),
-    ))
-    .await
-    .unwrap();
-
-    db.execute(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO jobs
-         (job_type, payload, status, attempts, max_attempts, available_at, locked_at, lock_token, last_error, created_at, updated_at, completed_at)
-         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL)"
-            .to_string(),
-        vec![
-            std::any::type_name::<WriteFileJob>().into(),
-            "{}".into(),
-            "queued".into(),
-            0.into(),
-            3.into(),
-            100.into(),
-            42.into(),
-            42.into(),
-        ],
-    ))
-    .await
-    .unwrap();
-
-    drop(db);
-
-    let processor = SqliteJobProcessor::<WriteFileJob>::connect(&db_url, test_options())
+    let output_path = dir.path().join("delayed.log");
+    processor
+        .enqueue_with_delay(
+            &WriteFileJob {
+                output_path: output_path.to_string_lossy().to_string(),
+                line: "delayed".to_string(),
+            },
+            Duration::from_secs(60),
+        )
         .await
         .unwrap();
 
-    let row = processor
-        .db()
-        .query_one(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT first_enqueued_at, queued_ms_total, processing_ms_total FROM jobs WHERE id = 1"
-                .to_string(),
-        ))
-        .await
-        .unwrap()
-        .unwrap();
-
-    let first_enqueued_at: Option<i64> = row.try_get_by_index(0).unwrap();
-    let queued_ms_total: i64 = row.try_get_by_index(1).unwrap();
-    let processing_ms_total: i64 = row.try_get_by_index(2).unwrap();
-    assert_eq!(first_enqueued_at, Some(42));
-    assert_eq!(queued_ms_total, 0);
-    assert_eq!(processing_ms_total, 0);
+    let outcome = processor.run_once().await.unwrap();
+    assert_eq!(outcome, RunOutcome::Idle);
+    assert!(!output_path.exists());
 }
 
 #[tokio::test]
 async fn run_until_notified_wakes_when_job_is_enqueued() {
     let dir = tempdir().unwrap();
-    let db_url = sqlite_url(dir.path().join("queue.db"));
+    let queue = MemoryQueue::default();
 
     let mut options = test_options();
     options.poll_interval = Duration::from_secs(60);
 
-    let processor = SqliteJobProcessor::<WriteFileJob>::connect(&db_url, options)
-        .await
-        .unwrap();
+    let processor = JobProcessor::<WriteFileJob, _>::new(queue, options);
 
     let output_path = dir.path().join("notify.log");
     let output_path_str = output_path.to_string_lossy().to_string();
@@ -389,14 +229,12 @@ async fn run_until_notified_wakes_when_job_is_enqueued() {
 #[tokio::test]
 async fn spawn_worker_processes_job_and_can_shutdown() {
     let dir = tempdir().unwrap();
-    let db_url = sqlite_url(dir.path().join("queue.db"));
+    let queue = MemoryQueue::default();
 
     let mut options = test_options();
     options.poll_interval = Duration::from_secs(60);
 
-    let processor = SqliteJobProcessor::<WriteFileJob>::connect(&db_url, options)
-        .await
-        .unwrap();
+    let processor = JobProcessor::<WriteFileJob, _>::new(queue, options);
     let worker = processor.spawn_worker();
 
     let output_path = dir.path().join("spawn.log");
@@ -430,14 +268,172 @@ async fn spawn_worker_processes_job_and_can_shutdown() {
 fn test_options() -> ProcessorOptions {
     ProcessorOptions {
         max_attempts: 3,
-        lock_timeout: Duration::from_secs(30),
         poll_interval: Duration::from_millis(1),
         backoff: BackoffStrategy::Fixed(Duration::ZERO),
     }
 }
 
-fn sqlite_url(path: impl AsRef<Path>) -> String {
-    format!("sqlite://{}?mode=rwc", path.as_ref().display())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryStatus {
+    Queued,
+    Processing,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryJob {
+    id: i64,
+    job_type: String,
+    payload: String,
+    status: MemoryStatus,
+    attempts: u32,
+    max_attempts: u32,
+    available_at: i64,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryClaim {
+    id: i64,
+}
+
+#[derive(Debug, Default)]
+struct MemoryState {
+    next_id: i64,
+    jobs: Vec<MemoryJob>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MemoryQueue {
+    inner: Arc<Mutex<MemoryState>>,
+}
+
+impl MemoryQueue {
+    fn job(&self, id: i64) -> MemoryJob {
+        self.inner
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .find(|job| job.id == id)
+            .unwrap()
+            .clone()
+    }
+}
+
+#[async_trait]
+impl JobQueue for MemoryQueue {
+    async fn enqueue(&self, job: NewJob) -> QueueResult<i64> {
+        let mut state = self.inner.lock().unwrap();
+        state.next_id = state.next_id.saturating_add(1);
+        let id = state.next_id;
+        state.jobs.push(MemoryJob {
+            id,
+            job_type: job.job_type,
+            payload: job.payload,
+            status: MemoryStatus::Queued,
+            attempts: 0,
+            max_attempts: job.max_attempts,
+            available_at: job.available_at,
+            last_error: None,
+        });
+        Ok(id)
+    }
+
+    async fn next_wakeup_at(&self, job_type: &str) -> QueueResult<Option<i64>> {
+        let state = self.inner.lock().unwrap();
+        Ok(state
+            .jobs
+            .iter()
+            .filter(|job| job.job_type == job_type && job.status == MemoryStatus::Queued)
+            .map(|job| job.available_at)
+            .min())
+    }
+}
+
+#[async_trait]
+impl LockableQueue for MemoryQueue {
+    type Claim = MemoryClaim;
+
+    async fn claim(&self, job_type: &str) -> QueueResult<Option<ClaimedJob<Self::Claim>>> {
+        let now = current_epoch_seconds();
+        let mut state = self.inner.lock().unwrap();
+        let Some(job) = state
+            .jobs
+            .iter_mut()
+            .filter(|job| {
+                job.job_type == job_type
+                    && job.status == MemoryStatus::Queued
+                    && job.available_at <= now
+            })
+            .min_by_key(|job| (job.available_at, job.id))
+        else {
+            return Ok(None);
+        };
+
+        job.status = MemoryStatus::Processing;
+        job.attempts = job.attempts.saturating_add(1);
+
+        Ok(Some(ClaimedJob {
+            id: job.id,
+            payload: job.payload.clone(),
+            attempts: job.attempts,
+            max_attempts: job.max_attempts,
+            claim: MemoryClaim { id: job.id },
+        }))
+    }
+
+    async fn complete(&self, job: ClaimedJob<Self::Claim>) -> QueueResult<()> {
+        let mut state = self.inner.lock().unwrap();
+        let Some(stored) = state
+            .jobs
+            .iter_mut()
+            .find(|stored| stored.id == job.claim.id)
+        else {
+            return Err(std::io::Error::other("claimed job not found").into());
+        };
+        stored.status = MemoryStatus::Completed;
+        stored.last_error = None;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RetryableQueue for MemoryQueue {
+    async fn retry(
+        &self,
+        job: ClaimedJob<Self::Claim>,
+        next_run_at: i64,
+        error: String,
+    ) -> QueueResult<()> {
+        let mut state = self.inner.lock().unwrap();
+        let Some(stored) = state
+            .jobs
+            .iter_mut()
+            .find(|stored| stored.id == job.claim.id)
+        else {
+            return Err(std::io::Error::other("claimed job not found").into());
+        };
+        stored.status = MemoryStatus::Queued;
+        stored.available_at = next_run_at;
+        stored.last_error = Some(error);
+        Ok(())
+    }
+
+    async fn fail(&self, job: ClaimedJob<Self::Claim>, error: String) -> QueueResult<()> {
+        let mut state = self.inner.lock().unwrap();
+        let Some(stored) = state
+            .jobs
+            .iter_mut()
+            .find(|stored| stored.id == job.claim.id)
+        else {
+            return Err(std::io::Error::other("claimed job not found").into());
+        };
+        stored.status = MemoryStatus::Failed;
+        stored.last_error = Some(error);
+        Ok(())
+    }
 }
 
 fn current_epoch_seconds() -> i64 {
@@ -446,52 +442,4 @@ fn current_epoch_seconds() -> i64 {
         .unwrap()
         .as_secs();
     i64::try_from(secs).unwrap_or(i64::MAX)
-}
-
-#[derive(Debug)]
-struct TimingRow {
-    first_enqueued_at: Option<i64>,
-    last_enqueued_at: Option<i64>,
-    first_started_at: Option<i64>,
-    last_started_at: Option<i64>,
-    last_finished_at: Option<i64>,
-    queued_ms_total: i64,
-    queued_ms_last: Option<i64>,
-    processing_ms_total: i64,
-    processing_ms_last: Option<i64>,
-}
-
-async fn load_timing_row(db: &DatabaseConnection, job_id: i64) -> TimingRow {
-    let row = db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT
-                first_enqueued_at,
-                last_enqueued_at,
-                first_started_at,
-                last_started_at,
-                last_finished_at,
-                queued_ms_total,
-                queued_ms_last,
-                processing_ms_total,
-                processing_ms_last
-             FROM jobs WHERE id = ?"
-                .to_string(),
-            vec![job_id.into()],
-        ))
-        .await
-        .unwrap()
-        .unwrap();
-
-    TimingRow {
-        first_enqueued_at: row.try_get_by_index(0).unwrap(),
-        last_enqueued_at: row.try_get_by_index(1).unwrap(),
-        first_started_at: row.try_get_by_index(2).unwrap(),
-        last_started_at: row.try_get_by_index(3).unwrap(),
-        last_finished_at: row.try_get_by_index(4).unwrap(),
-        queued_ms_total: row.try_get_by_index(5).unwrap(),
-        queued_ms_last: row.try_get_by_index(6).unwrap(),
-        processing_ms_total: row.try_get_by_index(7).unwrap(),
-        processing_ms_last: row.try_get_by_index(8).unwrap(),
-    }
 }

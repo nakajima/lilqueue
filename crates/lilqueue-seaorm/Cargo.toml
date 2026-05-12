@@ -1,0 +1,20 @@
+[package]
+name = "lilqueue-seaorm"
+version = "0.1.0"
+edition = "2024"
+description = "SeaORM SQLite adapter for lilqueue"
+license = "BSD-3-Clause"
+repository = "https://github.com/nakajima/lilqueue"
+readme = "README.md"
+keywords = ["jobs", "queue", "seaorm", "sqlite"]
+categories = ["asynchronous", "database"]
+
+[dependencies]
+async-trait = "0.1"
+lilqueue = { path = "../..", version = "0.1.0" }
+sea-orm = { version = "1.1.19", default-features = false, features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

@@ -36,7 +36,6 @@ impl Default for BackoffStrategy {
 #[derive(Debug, Clone)]
 pub struct ProcessorOptions {
     pub max_attempts: u32,
-    pub lock_timeout: Duration,
     pub poll_interval: Duration,
     pub backoff: BackoffStrategy,
 }
@@ -45,7 +44,6 @@ impl Default for ProcessorOptions {
     fn default() -> Self {
         Self {
             max_attempts: 20,
-            lock_timeout: Duration::from_secs(300),
             poll_interval: Duration::from_millis(250),
             backoff: BackoffStrategy::default(),
         }
@@ -76,6 +74,10 @@ impl JobError {
 
 #[async_trait]
 pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
+    fn job_type() -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     async fn process(&self) -> Result<(), JobError>;
 }
 
